@@ -56,6 +56,15 @@ const interrupted = () =>
     }
   );
 
+const failed = () =>
+  threadState(
+    { messages: [message("h0")] },
+    {
+      next: ["agent"],
+      tasks: [{ id: "task-1", name: "agent", error: "boom", interrupts: [] }],
+    }
+  );
+
 function createClient() {
   return {
     threads: {
@@ -187,10 +196,10 @@ async function submit(view: View, submitOptions?: Record<string, unknown>) {
   });
 }
 
-async function startRun(view: View) {
+async function startRun(view: View, submitOptions?: Record<string, unknown>) {
   let running!: Promise<unknown>;
   await act(async () => {
-    running = view.current.submit({ messages: [] });
+    running = view.current.submit({ messages: [] }, submitOptions);
   });
   await settle();
   return { running };
@@ -253,41 +262,96 @@ describe("useStream (old engine) thread state after stop and after a run", () =>
     }
   );
 
-  it("stop shows no breakpoint or error from the cancel", async () => {
-    const client = createClient();
-    serve(client, threadState({ messages: [message("h0")] }));
-    const view = await renderStream(client, { threadId: "t1" });
-    serve(
-      client,
-      threadState(
+  it.each([
+    { label: "no onFinish", onFinish: undefined },
+    {
+      label: "an onFinish that takes the state",
+      onFinish: (_state: unknown) => undefined,
+    },
+  ])(
+    "stop shows no breakpoint or error from the cancel ($label)",
+    async ({ onFinish }) => {
+      const client = createClient();
+      serve(client, threadState({ messages: [message("h0")] }));
+      const view = await renderStream(client, { threadId: "t1", onFinish });
+      serve(
+        client,
+        threadState(
+          { messages: [message("h0")] },
+          {
+            next: ["agent"],
+            tasks: [
+              {
+                id: "task-1",
+                name: "agent",
+                error: "CancelledError()",
+                interrupts: [],
+              },
+            ],
+          }
+        )
+      );
+
+      mockRun(
+        client,
+        [{ event: "values", data: { messages: [message("h0")] } }],
+        {
+          hang: true,
+        }
+      );
+      await stop(view, await startRun(view));
+
+      expect(view.current.interrupts).toEqual([]);
+      expect(view.current.interrupt).toBeUndefined();
+      expect(view.current.error).toBeUndefined();
+    }
+  );
+
+  it.each([
+    {
+      label: "an interrupt the stopped run answered",
+      shown: interrupted(),
+      submitOptions: { command: { resume: "yes" } },
+      kept: threadState(
         { messages: [message("h0")] },
         {
           next: ["agent"],
           tasks: [
             {
-              id: "task-1",
+              id: "task-2",
               name: "agent",
               error: "CancelledError()",
               interrupts: [],
             },
           ],
         }
-      )
-    );
+      ),
+      interrupts: [{ when: "breakpoint" }],
+      error: undefined,
+    },
+    {
+      label: "a task error from before the run",
+      shown: failed(),
+      submitOptions: undefined,
+      kept: failed(),
+      interrupts: [],
+      error: "boom",
+    },
+  ])(
+    "stop on a thread showing $label shows what the server kept",
+    async ({ shown, submitOptions, kept, interrupts, error }) => {
+      const client = createClient();
+      serve(client, shown);
+      const view = await renderStream(client, { threadId: "t1" });
+      serve(client, kept);
 
-    mockRun(
-      client,
-      [{ event: "values", data: { messages: [message("h0")] } }],
-      {
-        hang: true,
-      }
-    );
-    await stop(view, await startRun(view));
+      mockRun(client, [], { hang: true });
+      await stop(view, await startRun(view, submitOptions));
 
-    expect(view.current.interrupts).toEqual([]);
-    expect(view.current.interrupt).toBeUndefined();
-    expect(view.current.error).toBeUndefined();
-  });
+      expect(view.current.interrupts).toEqual(interrupts);
+      expect(view.current.error).toBe(error);
+    }
+  );
 
   it.each([{ fetchStateHistory: false }, { fetchStateHistory: true }])(
     "stop right after continuing from a breakpoint still shows it (fetchStateHistory: $fetchStateHistory)",
@@ -544,7 +608,7 @@ describe("useStream (old engine) thread state after stop and after a run", () =>
     expect(view.current.messages).toEqual(next);
   });
 
-  it.each([
+  const answeringRuns = [
     {
       via: "submit",
       run: async (client: TestClient, view: View, events: StreamEvents) => {
@@ -561,21 +625,26 @@ describe("useStream (old engine) thread state after stop and after a run", () =>
         });
       },
     },
-  ])("a run that answers an interrupt removes it ($via)", async ({ run }) => {
-    const client = createClient();
-    serve(client, interrupted());
-    const view = await renderStream(client, { threadId: "t1" });
-    expect(view.current.interrupts.map((i) => i.id)).toEqual(["int-1"]);
-    const answered = [message("h0"), message("a0", "ai")];
-    serve(client, threadState({ messages: answered }));
+  ];
 
-    await run(client, view, [
-      { event: "values", data: { messages: answered } },
-    ]);
+  it.each(answeringRuns)(
+    "a run that answers an interrupt removes it ($via)",
+    async ({ run }) => {
+      const client = createClient();
+      serve(client, interrupted());
+      const view = await renderStream(client, { threadId: "t1" });
+      expect(view.current.interrupts.map((i) => i.id)).toEqual(["int-1"]);
+      const answered = [message("h0"), message("a0", "ai")];
+      serve(client, threadState({ messages: answered }));
 
-    expect(view.current.interrupts).toEqual([]);
-    expect(view.current.messages).toEqual(answered);
-  });
+      await run(client, view, [
+        { event: "values", data: { messages: answered } },
+      ]);
+
+      expect(view.current.interrupts).toEqual([]);
+      expect(view.current.messages).toEqual(answered);
+    }
+  );
 
   it("a run that succeeds clears a task error read before it", async () => {
     const client = createClient();
@@ -663,6 +732,54 @@ describe("useStream (old engine) thread state after stop and after a run", () =>
         expect.objectContaining({ run_id: "run-1" })
       );
       expect(view.current.messages).toEqual(answered);
+    }
+  );
+
+  it.each(answeringRuns)(
+    "a failed read after a run reports no error without history ($via)",
+    async ({ run }) => {
+      const onError = vi.fn();
+      const client = createClient();
+      serve(client, interrupted());
+      const view = await renderStream(client, { threadId: "t1", onError });
+      client.threads.getState.mockRejectedValue(new Error("offline"));
+
+      await run(client, view, [
+        {
+          event: "values",
+          data: { messages: [message("h0"), message("a0", "ai")] },
+        },
+      ]);
+
+      expect(view.current.error).toBeUndefined();
+      expect(onError).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each(answeringRuns)(
+    "a run with a user thread whose mutate returns no promise still finishes ($via)",
+    async ({ run }) => {
+      const onFinish = vi.fn(() => {});
+      const onError = vi.fn();
+      const client = createClient();
+      const view = await renderStream(client, {
+        threadId: "t1",
+        fetchStateHistory: true,
+        thread: { ...userThread(), mutate: vi.fn() },
+        onFinish,
+        onError,
+      });
+
+      await run(client, view, [
+        {
+          event: "values",
+          data: { messages: [message("h0"), message("a0", "ai")] },
+        },
+      ]);
+
+      expect(onFinish).toHaveBeenCalledTimes(1);
+      expect(view.current.error).toBeUndefined();
+      expect(onError).not.toHaveBeenCalled();
     }
   );
 

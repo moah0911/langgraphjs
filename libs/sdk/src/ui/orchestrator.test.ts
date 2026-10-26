@@ -826,6 +826,17 @@ describe("StreamOrchestrator", () => {
         }
       );
 
+    const failed = () =>
+      stateWith(
+        { messages: [message("h0")] },
+        {
+          next: ["agent"],
+          tasks: [
+            { id: "task-1", name: "agent", error: "boom", interrupts: [] },
+          ],
+        }
+      );
+
     const getState = () => client.threads.getState as Mock;
     const getHistory = () => client.threads.getHistory as Mock;
     const reads = (fetchStateHistory: boolean) =>
@@ -930,39 +941,97 @@ describe("StreamOrchestrator", () => {
       }
     );
 
-    it("stop shows no breakpoint or error from the cancel", async () => {
-      serve(stateWith({ messages: [message("h0")] }));
-      const orch = await openThread();
-      serve(
-        stateWith(
+    it.each([
+      { label: "no onFinish", onFinish: undefined },
+      {
+        label: "an onFinish that takes the state",
+        onFinish: (_state: unknown) => undefined,
+      },
+    ])(
+      "stop shows no breakpoint or error from the cancel ($label)",
+      async ({ onFinish }) => {
+        serve(stateWith({ messages: [message("h0")] }));
+        const orch = await openThread({ onFinish });
+        serve(
+          stateWith(
+            { messages: [message("h0")] },
+            {
+              next: ["agent"],
+              tasks: [
+                {
+                  id: "task-1",
+                  name: "agent",
+                  error: "CancelledError()",
+                  interrupts: [],
+                },
+              ],
+            }
+          )
+        );
+
+        mockRun([{ event: "values", data: { messages: [message("h0")] } }], {
+          hang: true,
+        });
+        const running = orch.submit({ messages: [] });
+        await flushMicrotasks();
+        await orch.stop();
+
+        expect(orch.interrupts).toEqual([]);
+        expect(orch.interrupt).toBeUndefined();
+        expect(orch.error).toBeUndefined();
+        await running;
+        orch.dispose();
+      }
+    );
+
+    it.each([
+      {
+        label: "an interrupt the stopped run answered",
+        shown: interrupted(),
+        submitOptions: { command: { resume: "yes" } },
+        kept: stateWith(
           { messages: [message("h0")] },
           {
             next: ["agent"],
             tasks: [
               {
-                id: "task-1",
+                id: "task-2",
                 name: "agent",
                 error: "CancelledError()",
                 interrupts: [],
               },
             ],
           }
-        )
-      );
+        ),
+        interrupts: [{ when: "breakpoint" }],
+        error: undefined,
+      },
+      {
+        label: "a task error from before the run",
+        shown: failed(),
+        submitOptions: undefined,
+        kept: failed(),
+        interrupts: [],
+        error: "boom",
+      },
+    ])(
+      "stop on a thread showing $label shows what the server kept",
+      async ({ shown, submitOptions, kept, interrupts, error }) => {
+        serve(shown);
+        const orch = await openThread();
+        serve(kept);
 
-      mockRun([{ event: "values", data: { messages: [message("h0")] } }], {
-        hang: true,
-      });
-      const running = orch.submit({ messages: [] });
-      await flushMicrotasks();
-      await orch.stop();
+        mockRun([], { hang: true });
+        const running = orch.submit({ messages: [] }, submitOptions);
+        await flushMicrotasks();
+        await orch.stop();
 
-      expect(orch.interrupts).toEqual([]);
-      expect(orch.interrupt).toBeUndefined();
-      expect(orch.error).toBeUndefined();
-      await running;
-      orch.dispose();
-    });
+        expect(orch.interrupts).toEqual(interrupts);
+        expect(orch.error).toBe(error);
+        await running;
+        orch.dispose();
+      }
+    );
 
     it.each([{ fetchStateHistory: false }, { fetchStateHistory: true }])(
       "stop right after continuing from a breakpoint still shows it (fetchStateHistory: $fetchStateHistory)",
@@ -1278,6 +1347,48 @@ describe("StreamOrchestrator", () => {
         expect(onFinish).toHaveBeenCalledTimes(1);
         expect(orch.streamError).toBeUndefined();
         expect(orch.messages).toEqual(answered);
+        orch.dispose();
+      }
+    );
+
+    it.each([
+      {
+        via: "submit",
+        run: async (
+          orch: StreamOrchestrator<TestState>,
+          events: StreamEvents
+        ) => {
+          mockRun(events);
+          await orch.submit({ messages: [] }, { command: { resume: "yes" } });
+        },
+      },
+      {
+        via: "joinStream",
+        run: async (
+          orch: StreamOrchestrator<TestState>,
+          events: StreamEvents
+        ) => {
+          mockJoin(events);
+          await orch.joinStream("run-1");
+        },
+      },
+    ])(
+      "a failed read after a run reports no error without history ($via)",
+      async ({ run }) => {
+        const onError = vi.fn();
+        serve(interrupted());
+        const orch = await openThread({ onError });
+        getState().mockRejectedValue(new Error("offline"));
+
+        await run(orch, [
+          {
+            event: "values",
+            data: { messages: [message("h0"), message("a0", "ai")] },
+          },
+        ]);
+
+        expect(orch.error).toBeUndefined();
+        expect(onError).not.toHaveBeenCalled();
         orch.dispose();
       }
     );

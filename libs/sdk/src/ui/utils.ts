@@ -29,6 +29,34 @@ export function hasInterruptOrError(state: ThreadState | undefined): boolean {
   );
 }
 
+/**
+ * `state` without the task errors that `before` did not show. The tasks a
+ * stop cancels read as failed, so a read after the stop would show the
+ * cancellation as the thread's error.
+ */
+export function withoutNewTaskErrors<S extends ThreadState>(
+  state: S,
+  before: ThreadState | undefined
+): S {
+  const shown = new Map(before?.tasks?.map((task) => [task.id, task.error]));
+  return {
+    ...state,
+    tasks: state.tasks?.map((task) =>
+      task.error == null || shown.get(task.id) === task.error
+        ? task
+        : { ...task, error: null }
+    ),
+  };
+}
+
+/** Options for one read of a thread's history. */
+export type HistoryReadOptions<StateType extends Record<string, unknown>> = {
+  /** A failed read records no error and calls no `onError`. */
+  quiet?: boolean;
+  /** Changes the states read before they are shown. */
+  map?: (data: ThreadState<StateType>[]) => ThreadState<StateType>[];
+};
+
 export function unique<T>(array: T[]) {
   return [...new Set(array)] as T[];
 }

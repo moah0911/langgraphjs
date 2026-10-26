@@ -15,8 +15,10 @@ import {
   filterStream,
   findLast,
   hasInterruptOrError,
+  type HistoryReadOptions,
   onFinishRequiresThreadState,
   unique,
+  withoutNewTaskErrors,
 } from "../ui/utils.js";
 import { StreamError } from "../ui/errors.js";
 import { getBranchContext } from "../ui/branching.js";
@@ -87,7 +89,12 @@ function useThreadHistory<StateType extends Record<string, unknown>>(
     submittingRef: RefObject<string | null>;
     onError?: (error: unknown, run?: RunCallbackMeta) => void;
   }
-): UseStreamThread<StateType> {
+): UseStreamThread<StateType> & {
+  read: (
+    threadId: string,
+    readOptions: HistoryReadOptions<StateType>
+  ) => Promise<ThreadState<StateType>[]>;
+} {
   const key = getFetchHistoryKey(client, threadId, limit);
   const [state, setState] = useState<{
     key: string | undefined;
@@ -110,7 +117,8 @@ function useThreadHistory<StateType extends Record<string, unknown>>(
   const fetcher = useCallback(
     (
       threadId: string | undefined | null,
-      limit: boolean | number
+      limit: boolean | number,
+      readOptions: HistoryReadOptions<StateType> = {}
     ): Promise<ThreadState<StateType>[]> => {
       // If only passthrough is enabled, don't fetch history
       if (options.passthrough) return Promise.resolve([]);
@@ -124,7 +132,8 @@ function useThreadHistory<StateType extends Record<string, unknown>>(
           return { key, data: undefined, error: undefined, isLoading: true };
         });
         return fetchHistory<StateType>(client, threadId, { limit }).then(
-          (data) => {
+          (fetched) => {
+            const data = readOptions.map?.(fetched) ?? fetched;
             setState((state) => {
               if (state.key !== key) return state;
               return { key, data, error: undefined, isLoading: false };
@@ -134,9 +143,14 @@ function useThreadHistory<StateType extends Record<string, unknown>>(
           (error) => {
             setState((state) => {
               if (state.key !== key) return state;
-              return { key, data: state.data, error, isLoading: false };
+              return {
+                key,
+                data: state.data,
+                error: readOptions.quiet ? state.error : error,
+                isLoading: false,
+              };
             });
-            onErrorRef.current?.(error);
+            if (!readOptions.quiet) onErrorRef.current?.(error);
             return Promise.reject(error);
           }
         );
@@ -168,6 +182,7 @@ function useThreadHistory<StateType extends Record<string, unknown>>(
     error: state.error,
     isLoading: state.isLoading,
     mutate: (mutateId?: string) => fetcher(mutateId ?? threadId, limit),
+    read: (readId, readOptions) => fetcher(readId, limit, readOptions),
   };
 }
 
@@ -479,11 +494,10 @@ export function useStreamLGP<
   const stop = async () => {
     const wasLoading = stream.isLoading;
     const streamStarts = streamStartsRef.current;
+    const shownHead = latestThreadHeadRef.current;
 
     const includeImplicitBranch =
       historyLimit === true || typeof historyLimit === "number";
-    const shouldRefetch =
-      includeImplicitBranch || onFinishRequiresThreadState(options.onFinish);
 
     const stopUpdates: Array<
       Partial<StateType> | ((prev: StateType) => Partial<StateType>)
@@ -507,15 +521,24 @@ export function useStreamLGP<
 
     // A cancelled run skips `onSuccess`, so the buffer still holds what it
     // streamed, including a message chunk the server never saved. Without
-    // history the head is left alone: a head read after a cancel shows the
-    // cancellation as an error, or the node it cut off as a breakpoint when
-    // that error is not on the last task. With a user-supplied `thread` and
-    // no history nothing is read, since server values would outrank its data.
+    // history the head is left alone, since a head read after a cancel shows
+    // the cancellation as an error or the node it cut off as a breakpoint.
+    // A head with an interrupt, a node to run or a task error is replaced,
+    // though, since the stopped run may have answered it; the read drops the
+    // errors of the tasks the stop cancelled. With a user-supplied `thread`
+    // and no history nothing is read, since server values would outrank its
+    // data.
     if (!wasLoading || !threadId) return;
     let newHistory: ThreadState<StateType>[] | null | undefined;
     try {
-      if (shouldRefetch) {
+      if (includeImplicitBranch) {
         newHistory = await history.mutate(threadId);
+      } else if (options.thread == null && hasInterruptOrError(shownHead)) {
+        newHistory = await builtInHistory.read(threadId, {
+          quiet: true,
+          map: (data) =>
+            data.map((state) => withoutNewTaskErrors(state, shownHead)),
+        });
       } else if (options.thread == null) {
         newHistory = await fetchHistory<StateType>(client, threadId, {
           limit: false,
@@ -544,6 +567,19 @@ export function useStreamLGP<
             head ?? historyValues
           )
     );
+  };
+
+  // The read after a run that succeeded; a failed read returns nothing.
+  // Without history the read only refreshes what the head shows, so a
+  // failure reports no error.
+  const readAfterRun = async (id: string, refetch: boolean) => {
+    try {
+      return refetch || options.thread != null
+        ? await history.mutate(id)
+        : await builtInHistory.read(id, { quiet: true });
+    } catch {
+      return undefined;
+    }
   };
 
   // --- TRANSPORT ---
@@ -702,9 +738,10 @@ export function useStreamLGP<
             shouldRefetch ||
             hasInterruptOrError(latestThreadHeadRef.current)
           ) {
-            const newHistory = await history
-              .mutate(usableThreadId!)
-              .catch(() => undefined);
+            const newHistory = await readAfterRun(
+              usableThreadId!,
+              shouldRefetch
+            );
             const lastHead = newHistory?.at(0);
             if (lastHead) {
               // We now have the latest update from /history
@@ -799,9 +836,7 @@ export function useStreamLGP<
             shouldRefetchJoin ||
             hasInterruptOrError(latestThreadHeadRef.current)
           ) {
-            const newHistory = await history
-              .mutate(threadId)
-              .catch(() => undefined);
+            const newHistory = await readAfterRun(threadId, shouldRefetchJoin);
             const lastHead = newHistory?.at(0);
             if (lastHead) {
               options.onFinish?.(lastHead, callbackMeta);

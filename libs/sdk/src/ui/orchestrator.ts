@@ -25,7 +25,9 @@ import {
   unique,
   filterStream,
   hasInterruptOrError,
+  type HistoryReadOptions,
   onFinishRequiresThreadState,
+  withoutNewTaskErrors,
 } from "./utils.js";
 import { getToolCallsWithResults } from "../utils/tools.js";
 import { flushPendingHeadlessToolInterrupts } from "../headless-tools.js";
@@ -349,16 +351,18 @@ export class StreamOrchestrator<
   }
 
   async #mutate(
-    mutateId?: string
+    mutateId?: string,
+    readOptions: HistoryReadOptions<StateType> = {}
   ): Promise<ThreadState<StateType>[] | undefined> {
     const tid = mutateId ?? this.#threadId;
     if (!tid) return undefined;
     try {
-      const data = await fetchHistory<StateType>(
+      const fetched = await fetchHistory<StateType>(
         this.#accessors.getClient(),
         tid,
         { limit: this.historyLimit }
       );
+      const data = readOptions.map?.(fetched) ?? fetched;
       // The thread switched during the read; its own fetch fills the history.
       if (tid !== this.#threadId) return data;
       this.#history = {
@@ -373,7 +377,7 @@ export class StreamOrchestrator<
       this.#notify();
       return data;
     } catch (err) {
-      if (tid !== this.#threadId) return undefined;
+      if (tid !== this.#threadId || readOptions.quiet) return undefined;
       this.#history = {
         ...this.#history,
         error: err,
@@ -817,12 +821,10 @@ export class StreamOrchestrator<
     const wasLoading = this.stream.isLoading;
     const threadId = this.#threadId;
     const streamStarts = this.#streamStarts;
+    const shownHead = this.branchContext.threadHead;
 
     const includeImplicitBranch =
       this.historyLimit === true || typeof this.historyLimit === "number";
-    const shouldRefetch =
-      includeImplicitBranch ||
-      onFinishRequiresThreadState(this.#options.onFinish);
 
     const stopUpdates: Array<
       Partial<StateType> | ((prev: StateType) => Partial<StateType>)
@@ -849,15 +851,28 @@ export class StreamOrchestrator<
 
     // A cancelled run skips `onSuccess`, so the buffer still holds what it
     // streamed, including a message chunk the server never saved. Without
-    // history the head is left alone: a head read after a cancel shows the
-    // cancellation as an error, or the node it cut off as a breakpoint when
-    // that error is not on the last task.
+    // history the head is left alone, since a head read after a cancel shows
+    // the cancellation as an error or the node it cut off as a breakpoint.
+    // A head with an interrupt, a node to run or a task error is replaced,
+    // though, since the stopped run may have answered it; the read drops the
+    // errors of the tasks the stop cancelled.
     if (!wasLoading || !threadId || this.#disposed) return;
-    const newHistory = shouldRefetch
-      ? await this.#mutate(threadId)
-      : await fetchHistory<StateType>(this.#accessors.getClient(), threadId, {
-          limit: false,
-        }).catch(() => undefined);
+    let newHistory: ThreadState<StateType>[] | undefined;
+    if (includeImplicitBranch) {
+      newHistory = await this.#mutate(threadId);
+    } else if (hasInterruptOrError(shownHead)) {
+      newHistory = await this.#mutate(threadId, {
+        quiet: true,
+        map: (data) =>
+          data.map((state) => withoutNewTaskErrors(state, shownHead)),
+      });
+    } else {
+      newHistory = await fetchHistory<StateType>(
+        this.#accessors.getClient(),
+        threadId,
+        { limit: false }
+      ).catch(() => undefined);
+    }
     if (
       newHistory == null ||
       this.#threadId !== threadId ||
@@ -951,7 +966,9 @@ export class StreamOrchestrator<
             shouldRefetchJoin ||
             hasInterruptOrError(this.branchContext.threadHead)
           ) {
-            const newHistory = await this.#mutate(tid);
+            const newHistory = await this.#mutate(tid, {
+              quiet: !shouldRefetchJoin,
+            });
             const lastHead = newHistory?.at(0);
             if (lastHead) {
               this.#options.onFinish?.(lastHead, callbackMeta);
@@ -1127,13 +1144,17 @@ export class StreamOrchestrator<
           if (rejoinKey) this.#runMetadataStorage?.removeItem(rejoinKey);
 
           // Interrupts, `next` and task errors come from the head, so only a
-          // re-read drops the ones this run answered or cleared.
+          // re-read drops the ones this run answered or cleared. Without
+          // history that is all the read is for, so a failure reports no
+          // error.
           if (
             (shouldRefetch ||
               hasInterruptOrError(this.branchContext.threadHead)) &&
             usableThreadId
           ) {
-            const newHistory = await this.#mutate(usableThreadId);
+            const newHistory = await this.#mutate(usableThreadId, {
+              quiet: !shouldRefetch,
+            });
             const lastHead = newHistory?.at(0);
             if (lastHead) {
               this.#options.onFinish?.(lastHead, callbackMeta);
