@@ -1,5 +1,23 @@
 # @langchain/langgraph
 
+## 1.5.4
+
+### Patch Changes
+
+- [#3119](https://github.com/langchain-ai/langgraphjs/pull/3119) [`58d490e`](https://github.com/langchain-ai/langgraphjs/commit/58d490e07568621787a814ab7ce24e5da0cfe658) Thanks [@eliornl](https://github.com/eliornl)! - fix(langgraph): keep every message a node returns in messages stream mode
+  
+  - In `streamMode: "messages"`, the id-less messages a node returned all got one id, and an id-less message could take the id of a sibling that had one, so the messages reducer kept only one of them and the saved state depended on the stream mode. Each id-less message of a node's output now gets its own id.
+  - Messages a node returns through `Command({ update })` are now emitted in `messages` mode, as in Python. So are all the messages of a list of updates that holds a `Command`, such as `ToolNode` returns when one of its tools returns a `Command`; before, none of that list's messages were emitted, and they reached clients only with the next `values` event.
+  - A model tagged `nostream` still streams no tokens, but when its node returns its message in a list with a `Command`, as `createAgent` does, that message now streams whole when the node ends, as it already did for a plain update and does in Python.
+  
+  `streamEvents` with `version: "v3"` is unchanged.
+
+- [#3127](https://github.com/langchain-ai/langgraphjs/pull/3127) [`a3fe525`](https://github.com/langchain-ai/langgraphjs/commit/a3fe52505c82953c9636330ab2d1266d382366ec) Thanks [@sera-wi](https://github.com/sera-wi)! - List a `ToolNode`'s tool names under the `__tools` node metadata key in `getGraph()` and `getGraphAsync()`, matching Python, so graph viewers such as Studio can show which tools it runs.
+
+- [#3118](https://github.com/langchain-ai/langgraphjs/pull/3118) [`7ab1b8d`](https://github.com/langchain-ai/langgraphjs/commit/7ab1b8d840c068c2593fea4683899508d93e6b33) Thanks [@eliornl](https://github.com/eliornl)! - fix(langgraph): stop reporting a paused tool as failed on the tools stream
+  
+  A tool that calls `interrupt()`, or whose run is drained, no longer emits `on_tool_error` on the `tools` stream mode. The tool is paused, not failed: on resume it runs again and emits `on_tool_start` and `on_tool_end`. `ToolNode` now re-throws a drain, as it already did an interrupt, instead of turning it into an error `ToolMessage`.
+
 ## 1.5.3
 
 ### Patch Changes
