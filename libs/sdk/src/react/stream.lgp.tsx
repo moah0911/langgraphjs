@@ -14,6 +14,7 @@ import {
 import {
   filterStream,
   findLast,
+  hasInterruptOrError,
   onFinishRequiresThreadState,
   unique,
 } from "../ui/utils.js";
@@ -377,6 +378,14 @@ export function useStreamLGP<
     options.initialValues ??
     ({} as StateType);
 
+  // A run's callbacks close over the render it started in; this is the head
+  // shown when it ends.
+  const latestThreadHeadRef = useRef(branchContext.threadHead);
+  latestThreadHeadRef.current = branchContext.threadHead;
+  // Bumped when a stream begins, not when a run is queued behind one, so a
+  // run queued before a stop that begins after it still counts.
+  const streamStartsRef = useRef(0);
+
   // Reconstruct subagents from history when:
   // 1. History is loaded (not loading, has data)
   // 2. No active stream is running
@@ -469,42 +478,72 @@ export function useStreamLGP<
 
   const stop = async () => {
     const wasLoading = stream.isLoading;
+    const streamStarts = streamStartsRef.current;
 
     const includeImplicitBranch =
       historyLimit === true || typeof historyLimit === "number";
     const shouldRefetch =
       includeImplicitBranch || onFinishRequiresThreadState(options.onFinish);
 
+    const stopUpdates: Array<
+      Partial<StateType> | ((prev: StateType) => Partial<StateType>)
+    > = [];
     await stream.stop(historyValues, {
-      onStop: (args) => {
+      onStop: ({ mutate }) => {
         if (runMetadataStorage && threadId) {
           const runId = runMetadataStorage.getItem(`lg:stream:${threadId}`);
           if (runId) void client.runs.cancel(threadId, runId);
           runMetadataStorage.removeItem(`lg:stream:${threadId}`);
         }
 
-        options.onStop?.(args);
+        options.onStop?.({
+          mutate: (update) => {
+            stopUpdates.push(update);
+            mutate(update);
+          },
+        });
       },
     });
 
-    // A cancelled run makes `enqueue()` throw `AbortError`, which skips its
-    // `onSuccess` history reconciliation (see `StreamManager.enqueue`). Left
-    // alone, the locally-buffered stream values — including any message
-    // chunk still being assembled when `stop()` was called — stay stuck in
-    // `stream.values` and keep outranking `historyValues` on every render
-    // until a thread switch or a full remount. Re-sync so the buffer only
-    // reflects what was actually persisted: refetch when the caller needs
-    // authoritative thread state (branching / `onFinish`), otherwise fall
-    // back to the already-cached `historyValues` to avoid an extra round
-    // trip on every cancel.
-    if (wasLoading && threadId) {
+    // A cancelled run skips `onSuccess`, so the buffer still holds what it
+    // streamed, including a message chunk the server never saved. Without
+    // history the head is left alone: a head read after a cancel shows the
+    // cancellation as an error, or the node it cut off as a breakpoint when
+    // that error is not on the last task. With a user-supplied `thread` and
+    // no history nothing is read, since server values would outrank its data.
+    if (!wasLoading || !threadId) return;
+    let newHistory: ThreadState<StateType>[] | null | undefined;
+    try {
       if (shouldRefetch) {
-        const newHistory = await history.mutate(threadId);
-        stream.setStreamValues(newHistory?.at(0)?.values ?? null);
-      } else {
-        stream.setStreamValues(historyValues);
+        newHistory = await history.mutate(threadId);
+      } else if (options.thread == null) {
+        newHistory = await fetchHistory<StateType>(client, threadId, {
+          limit: false,
+        });
       }
+    } catch {
+      return;
     }
+    if (
+      threadIdRef.current !== threadId ||
+      streamStartsRef.current !== streamStarts
+    ) {
+      return;
+    }
+    // Without a head the history takes over. Null keeps it live; only onStop
+    // edits need a copy of it to sit on.
+    const head = newHistory?.at(0)?.values;
+    stream.setStreamValues(
+      head == null && stopUpdates.length === 0
+        ? null
+        : stopUpdates.reduce<StateType>(
+            (prev, update) => ({
+              ...prev,
+              ...(typeof update === "function" ? update(prev) : update),
+            }),
+            head ?? historyValues
+          )
+    );
   };
 
   // --- TRANSPORT ---
@@ -541,6 +580,7 @@ export function useStreamLGP<
 
     await stream.start(
       async (signal: AbortSignal) => {
+        streamStartsRef.current += 1;
         stream.setStreamValues((values) => {
           const prev = { ...historyValues, ...values };
           if (submitOptions?.optimisticValues != null) {
@@ -656,8 +696,15 @@ export function useStreamLGP<
         async onSuccess() {
           if (rejoinKey) runMetadataStorage?.removeItem(rejoinKey);
 
-          if (shouldRefetch) {
-            const newHistory = await history.mutate(usableThreadId!);
+          // Interrupts, `next` and task errors come from the head, so only a
+          // re-read drops the ones this run answered or cleared.
+          if (
+            shouldRefetch ||
+            hasInterruptOrError(latestThreadHeadRef.current)
+          ) {
+            const newHistory = await history
+              .mutate(usableThreadId!)
+              .catch(() => undefined);
             const lastHead = newHistory?.at(0);
             if (lastHead) {
               // We now have the latest update from /history
@@ -665,7 +712,8 @@ export function useStreamLGP<
               options.onFinish?.(lastHead, callbackMeta);
               return null;
             }
-          } else if (
+          }
+          if (
             options.onFinish != null &&
             !onFinishRequiresThreadState(options.onFinish)
           ) {
@@ -719,6 +767,7 @@ export function useStreamLGP<
 
     await stream.start(
       async (signal: AbortSignal) => {
+        streamStartsRef.current += 1;
         threadIdStreamingRef.current = threadId;
         const stream = client.runs.joinStream(threadId, runId, {
           signal,
@@ -746,21 +795,29 @@ export function useStreamLGP<
         },
         async onSuccess() {
           runMetadataStorage?.removeItem(`lg:stream:${threadId}`);
-          if (!shouldRefetchJoin) {
-            if (
-              options.onFinish != null &&
-              !onFinishRequiresThreadState(options.onFinish)
-            ) {
-              options.onFinish(
-                undefined as unknown as ThreadState<StateType>,
-                callbackMeta
-              );
+          if (
+            shouldRefetchJoin ||
+            hasInterruptOrError(latestThreadHeadRef.current)
+          ) {
+            const newHistory = await history
+              .mutate(threadId)
+              .catch(() => undefined);
+            const lastHead = newHistory?.at(0);
+            if (lastHead) {
+              options.onFinish?.(lastHead, callbackMeta);
+              return null;
             }
-            return;
           }
-          const newHistory = await history.mutate(threadId);
-          const lastHead = newHistory?.at(0);
-          if (lastHead) options.onFinish?.(lastHead, callbackMeta);
+          if (
+            options.onFinish != null &&
+            !onFinishRequiresThreadState(options.onFinish)
+          ) {
+            options.onFinish(
+              undefined as unknown as ThreadState<StateType>,
+              callbackMeta
+            );
+          }
+          return undefined;
         },
         onError(error) {
           options.onError?.(error, callbackMeta);

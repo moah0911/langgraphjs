@@ -1,3 +1,5 @@
+import type { ThreadState } from "../schema.js";
+
 /**
  * Returns true when `onFinish` declares at least one parameter and therefore
  * needs the server-fetched thread head. A zero-arity `onFinish` is treated as
@@ -11,6 +13,20 @@
 export function onFinishRequiresThreadState(onFinish: unknown): boolean {
   if (typeof onFinish !== "function") return false;
   return onFinish.length > 0;
+}
+
+/**
+ * Whether a thread state has interrupts, a node still to run or a task error,
+ * all of which a run on the thread can answer or clear.
+ */
+export function hasInterruptOrError(state: ThreadState | undefined): boolean {
+  if (state == null) return false;
+  return (
+    (state.next?.length ?? 0) > 0 ||
+    (state.tasks ?? []).some(
+      (task) => task.error != null || (task.interrupts?.length ?? 0) > 0
+    )
+  );
 }
 
 export function unique<T>(array: T[]) {

@@ -21,7 +21,12 @@ import {
   userFacingInterruptsFromThreadTasks,
   userFacingInterruptsFromValuesArray,
 } from "./interrupts.js";
-import { unique, filterStream, onFinishRequiresThreadState } from "./utils.js";
+import {
+  unique,
+  filterStream,
+  hasInterruptOrError,
+  onFinishRequiresThreadState,
+} from "./utils.js";
 import { getToolCallsWithResults } from "../utils/tools.js";
 import { flushPendingHeadlessToolInterrupts } from "../headless-tools.js";
 import type {
@@ -166,6 +171,12 @@ export class StreamOrchestrator<
   #queueUnsub: (() => void) | null = null;
 
   #disposed = false;
+
+  /**
+   * Bumped when a stream begins, not when a run is queued behind one, so a
+   * run queued before a stop that begins after it still counts.
+   */
+  #streamStarts = 0;
 
   #handledHeadlessToolInterruptIds = new Set<string>();
 
@@ -348,6 +359,8 @@ export class StreamOrchestrator<
         tid,
         { limit: this.historyLimit }
       );
+      // The thread switched during the read; its own fetch fills the history.
+      if (tid !== this.#threadId) return data;
       this.#history = {
         data,
         error: undefined,
@@ -360,6 +373,7 @@ export class StreamOrchestrator<
       this.#notify();
       return data;
     } catch (err) {
+      if (tid !== this.#threadId) return undefined;
       this.#history = {
         ...this.#history,
         error: err,
@@ -802,6 +816,7 @@ export class StreamOrchestrator<
   async stop(): Promise<void> {
     const wasLoading = this.stream.isLoading;
     const threadId = this.#threadId;
+    const streamStarts = this.#streamStarts;
 
     const includeImplicitBranch =
       this.historyLimit === true || typeof this.historyLimit === "number";
@@ -809,8 +824,11 @@ export class StreamOrchestrator<
       includeImplicitBranch ||
       onFinishRequiresThreadState(this.#options.onFinish);
 
+    const stopUpdates: Array<
+      Partial<StateType> | ((prev: StateType) => Partial<StateType>)
+    > = [];
     await this.stream.stop(this.historyValues, {
-      onStop: (args) => {
+      onStop: ({ mutate }) => {
         if (this.#runMetadataStorage && this.#threadId) {
           const runId = this.#runMetadataStorage.getItem(
             `lg:stream:${this.#threadId}`
@@ -820,28 +838,47 @@ export class StreamOrchestrator<
           }
           this.#runMetadataStorage.removeItem(`lg:stream:${this.#threadId}`);
         }
-        this.#options.onStop?.(args);
+        this.#options.onStop?.({
+          mutate: (update) => {
+            stopUpdates.push(update);
+            mutate(update);
+          },
+        });
       },
     });
 
-    // A cancelled run makes `enqueue()` throw `AbortError`, which skips its
-    // `onSuccess` history reconciliation (see `StreamManager.enqueue`). Left
-    // alone, the locally-buffered stream values — including any message
-    // chunk still being assembled when `stop()` was called — stay stuck in
-    // `stream.values` and keep outranking `historyValues` on every render
-    // until a thread switch or a full remount. Re-sync so the buffer only
-    // reflects what was actually persisted: refetch when the caller needs
-    // authoritative thread state (branching / `onFinish`), otherwise fall
-    // back to the already-cached `historyValues` to avoid an extra round
-    // trip on every cancel.
-    if (wasLoading && threadId) {
-      if (shouldRefetch) {
-        const newHistory = await this.#mutate(threadId);
-        this.stream.setStreamValues(newHistory?.at(0)?.values ?? null);
-      } else {
-        this.stream.setStreamValues(this.historyValues);
-      }
+    // A cancelled run skips `onSuccess`, so the buffer still holds what it
+    // streamed, including a message chunk the server never saved. Without
+    // history the head is left alone: a head read after a cancel shows the
+    // cancellation as an error, or the node it cut off as a breakpoint when
+    // that error is not on the last task.
+    if (!wasLoading || !threadId || this.#disposed) return;
+    const newHistory = shouldRefetch
+      ? await this.#mutate(threadId)
+      : await fetchHistory<StateType>(this.#accessors.getClient(), threadId, {
+          limit: false,
+        }).catch(() => undefined);
+    if (
+      newHistory == null ||
+      this.#threadId !== threadId ||
+      this.#streamStarts !== streamStarts
+    ) {
+      return;
     }
+    // Without a head the history takes over. Null keeps it live; only onStop
+    // edits need a copy of it to sit on.
+    const head = newHistory.at(0)?.values;
+    this.stream.setStreamValues(
+      head == null && stopUpdates.length === 0
+        ? null
+        : stopUpdates.reduce<StateType>(
+            (prev, update) => ({
+              ...prev,
+              ...(typeof update === "function" ? update(prev) : update),
+            }),
+            head ?? this.historyValues
+          )
+    );
   }
 
   /**
@@ -889,6 +926,7 @@ export class StreamOrchestrator<
 
     await this.stream.start(
       async (signal: AbortSignal) => {
+        this.#streamStarts += 1;
         const rawStream = client.runs.joinStream(tid, runId, {
           signal,
           lastEventId,
@@ -909,21 +947,27 @@ export class StreamOrchestrator<
         callbacks: this.#options,
         onSuccess: async () => {
           this.#runMetadataStorage?.removeItem(`lg:stream:${tid}`);
-          if (!shouldRefetchJoin) {
-            if (
-              this.#options.onFinish != null &&
-              !onFinishRequiresThreadState(this.#options.onFinish)
-            ) {
-              this.#options.onFinish(
-                undefined as unknown as ThreadState<StateType>,
-                callbackMeta
-              );
+          if (
+            shouldRefetchJoin ||
+            hasInterruptOrError(this.branchContext.threadHead)
+          ) {
+            const newHistory = await this.#mutate(tid);
+            const lastHead = newHistory?.at(0);
+            if (lastHead) {
+              this.#options.onFinish?.(lastHead, callbackMeta);
+              return null;
             }
-            return;
           }
-          const newHistory = await this.#mutate(tid);
-          const lastHead = newHistory?.at(0);
-          if (lastHead) this.#options.onFinish?.(lastHead, callbackMeta);
+          if (
+            this.#options.onFinish != null &&
+            !onFinishRequiresThreadState(this.#options.onFinish)
+          ) {
+            this.#options.onFinish(
+              undefined as unknown as ThreadState<StateType>,
+              callbackMeta
+            );
+          }
+          return undefined;
         },
         onError: (error) => {
           this.#options.onError?.(error, callbackMeta);
@@ -988,6 +1032,7 @@ export class StreamOrchestrator<
 
     return this.stream.start(
       async (signal) => {
+        this.#streamStarts += 1;
         usableThreadId = this.#threadId;
         if (usableThreadId) {
           this.#threadIdStreaming = usableThreadId;
@@ -1081,14 +1126,21 @@ export class StreamOrchestrator<
         onSuccess: async () => {
           if (rejoinKey) this.#runMetadataStorage?.removeItem(rejoinKey);
 
-          if (shouldRefetch && usableThreadId) {
+          // Interrupts, `next` and task errors come from the head, so only a
+          // re-read drops the ones this run answered or cleared.
+          if (
+            (shouldRefetch ||
+              hasInterruptOrError(this.branchContext.threadHead)) &&
+            usableThreadId
+          ) {
             const newHistory = await this.#mutate(usableThreadId);
             const lastHead = newHistory?.at(0);
             if (lastHead) {
               this.#options.onFinish?.(lastHead, callbackMeta);
               return null;
             }
-          } else if (
+          }
+          if (
             this.#options.onFinish != null &&
             !onFinishRequiresThreadState(this.#options.onFinish)
           ) {
